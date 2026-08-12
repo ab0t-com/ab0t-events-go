@@ -1,0 +1,10 @@
+# Default owners for everything in this repo.
+# Update the team/handle to your org's actual reviewers.
+* @ab0t-com/eng
+
+# The core contracts and security-sensitive adapters warrant closer review.
+/events/                @ab0t-com/eng
+/adapters/httpdeliver/  @ab0t-com/eng
+/adapters/hmacsign/     @ab0t-com/eng
+/adapters/stdwebhook/   @ab0t-com/eng
+/SECURITY.md            @ab0t-com/eng

@@ -1,0 +1,176 @@
+# Changelog
+
+All notable changes to this project are documented here. The format is based on
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres
+to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Security (audit 2026-08-12 remediation — Findings 1–4)
+- **`hmacsign` now binds the timestamp and delivery id into the signature**
+  (Finding 1, High). The MAC covers `{deliveryID}.{timestamp}.{body}` instead of
+  the body only, so a captured request can't be replayed with a refreshed
+  timestamp or a forged delivery id. **Breaking:** `Signature`, `Verify`, and
+  `VerifyRequest` now take the delivery id and timestamp (mirroring `stdwebhook`).
+- **SSRF guard is now an allowlist** (Finding 2, Medium). `httpdeliver` permits
+  only public global-unicast addresses and additionally blocks CGNAT
+  `100.64.0.0/10`, `0.0.0.0/8`, NAT64 `64:ff9b::/96` (+`64:ff9b:1::/48`), and the
+  IETF test/benchmark ranges; the doc comment now matches the behavior.
+- **HTTPS-only option** (Finding 3, Medium). New `httpdeliver.Config.RequireHTTPS`
+  (on by default in `NewSecure`) rejects plaintext `http://` (except to loopback)
+  with `ErrInsecureScheme`.
+- **Bounded in-process queue** (Finding 4, Medium). New `inproc.Config.MaxDepth`
+  (`DefaultMaxDepth` 10000; negative = unbounded); `Enqueue` returns the new
+  `ErrQueueFull` at capacity (backpressure) instead of growing memory without
+  bound.
+- **Absolute retry-delay ceiling** (Finding 6, Low). `Process` clamps every retry
+  delay to the new `events.AbsoluteMaxRetryDelay` (24 h) even when
+  `RetryPolicy.MaxDelay == 0`, so a hostile `Retry-After` can't park a job.
+- **Replay works on durable queues** (Finding 7, Low). `Replay` now persists a
+  `pending` status to the log before enqueuing, so a rehydrated (SQS) job is
+  non-terminal and re-delivers instead of being dropped as a duplicate.
+- **Rate-limiter bucket eviction** (Finding 8, Low). `ratelimit.Limiter` evicts
+  buckets idle for 10 min (swept ≤ once/min) so the per-host map can't grow
+  unbounded; `Limiter.NumBuckets()` exposes the footprint.
+- **Optional Emit payload cap** (Finding 9, Low). New optional
+  `events.Deps.MaxPayloadBytes`; `Emit` rejects oversized payloads up front with
+  the new `ErrPayloadTooLarge` (0 = unbounded, non-breaking).
+- Findings 5, 10, 11, 12, 13 and the `autodisable` half of 8 were triaged and
+  **ACCEPTED** (by-design / accepted-risk) with rationale + residual-risk notes in
+  `docs/SECURITY-AUDIT_20260812.md`.
+
+### Added (v0.2 — "Production-ready & interoperable"; tickets EV-001..EV-007)
+- **Pluggable signing schemes.** The `Signer` port now takes a `SigningInput`
+  (id, delivery id, timestamp, body, secret) and returns the auth headers, so a
+  scheme can bind the signature to id + timestamp and own its headers.
+- **Standard Webhooks adapter** (`adapters/stdwebhook`) — `webhook-id` /
+  `webhook-timestamp` / `webhook-signature: v1,<base64>` over `id.ts.body`, with
+  `Verify` / `VerifyRequest`. Interop with any Standard Webhooks verifier.
+- **Startup recovery sweeper** — `Service.Recover(ctx, orgID)` re-enqueues
+  non-terminal (pending/failed) deliveries from the log after a restart. New
+  `DeliveryFilter.Status`.
+- **Metrics observer** (`adapters/metrics`) — dependency-free `Collector`
+  tallying attempts by status/code + latency, with `Snapshot`, `MeanLatency`,
+  `SuccessRate`. `events.MultiObserver` composes observers.
+- **Auto-disable circuit breaker** (`adapters/autodisable`) — pauses a
+  subscription after N consecutive dead-letters and fires an `OnDisable` hook.
+- **Admin HTTP surface** (`adapters/adminhttp`) — stdlib handler for subscription
+  CRUD, secret rotation, delivery list/detail, replay, plus a self-contained HTML
+  delivery-log UI; org taken from an injectable resolver (never client-trusted).
+- **Secret rotation** — `Service.RotateSecret(ctx, orgID, subID)`.
+- **Detail lookups** — `Service.GetSubscription` and `Service.GetDelivery`.
+- **Retry-After** — the deliverer parses a `Retry-After` header (seconds or HTTP
+  date) into `DeliveryResponse.RetryAfter`; the core honors it as a lower bound on
+  the next backoff, capped by `MaxDelay`.
+- **Ping / test-event** — `Service.Ping(ctx, orgID, subID)` delivers a synthetic
+  `webhook.ping` to one endpoint (bypassing the type filter) so orgs can verify an
+  endpoint; exposed as `POST /subscriptions/{id}/ping`.
+- **User-Agent** — outbound requests send a stable `User-Agent`
+  (`httpdeliver.DefaultUserAgent`, overridable via `Config.UserAgent`).
+- **Benchmarks** for Emit fan-out and Process.
+- **Repo/GitHub scaffolding** — CI + release workflows, Dependabot, issue/PR
+  templates, CODEOWNERS, code of conduct, README badges + install instructions.
+- **Durable queue (SQS)** — `adapters/sqsqueue`, a durable `DeliveryQueue` that
+  survives restarts. Messages carry only an id-only `events.JobRef` (never the
+  payload or secret); the consumer rehydrates the full job from the store + log.
+  Bring your own SQS client via the `SQS` interface (no infra assumptions).
+- **Reusable durable-queue primitives** — `events.JobRef`, `Job.Ref()`,
+  `events.Rehydrator`, `events.RefDispatcher`, and `Service.Rehydrate` /
+  `Service.ProcessRef` (rehydrate + dispatch; drops terminal/missing references,
+  making at-least-once queues duplicate-safe). Write a Redis/Postgres/Kafka queue
+  the same way.
+- **Per-destination rate limiting** — `adapters/ratelimit`, a token-bucket
+  `Deliverer` decorator (keyed by host by default) that throttles bursts and
+  respects the context deadline. Stdlib-only.
+- **Seams & contracts doc** — `docs/CONTRACTS.md` documents every port's
+  behavioral contract: caller, concurrency, tenancy, errors, and implementers.
+- **Event catalog** (ticket C-13) — `events.Catalog`, a pure, concurrency-safe
+  registry of the event types a service publishes
+  (`EventTypeDef{Type, Description, Example, Deprecated}`;
+  `Register`/`Get`/`Has`/`List`). Wire it via `Deps.Catalog`; a **strict** catalog
+  (`NewCatalog(true)`) makes `Emit` reject undeclared types with the new
+  `ErrUnknownEventType` before any store/queue I/O (a non-strict catalog is
+  documentation only). The admin surface serves it at `GET /event-types` via
+  `adminhttp.New(api, org, adminhttp.WithCatalog(cat))`.
+- **Secret encryption at rest** (ticket C-14) — a new `events.SecretCodec` seam
+  (`Encrypt`/`Decrypt`) plus `adapters/securestore`, a `SubscriptionStore`
+  decorator that encrypts `Subscription.Secret` on `Put` and decrypts it on
+  `Get`/`ListForOrg`/`ListForOrgAndType` (adds no cross-org path; an empty secret
+  passes through). Two codecs ship: `adapters/aesgcm` (stdlib AES-256-GCM,
+  caller-held 32-byte key, random nonce per encrypt) and `adapters/kmscodec` (AWS
+  KMS, bring-your-own client, optional `EncryptionContext`). `go.mod` adds
+  `service/kms v1.38.3` (cached, offline).
+- **Payload / content filters** (ticket C-15) — `Subscription.PayloadFilters
+  []PayloadFilter{Path, Equals}` (also on `NewSubscription` and the admin
+  create-subscription body). During `Emit` fan-out a subscription is delivered
+  only when its type filter matches **and** every payload filter matches the event
+  payload (dot-path equality, dependency-free `encoding/json`); a filtered-out
+  subscription gets no delivery (no log record, no queue job). Empty filters
+  preserve today's behavior. `Subscription.MatchesPayload([]byte) bool` is
+  exported for previews. Persisted by the `memory` and `dynamo` stores.
+- **Custom / tracing headers** (ticket C-16) — `Event.Headers map[string]string`
+  is merged onto every outbound delivery and persisted in the event snapshot
+  (durable-safe: survives the SQS `JobRef` round trip and replays). Reserved
+  headers the core/signer own (`Content-Type`, `Host`, `Content-Length`, the
+  `X-Event-*`/`X-Delivery-Id`/`X-Attempt`/`X-Signature` headers, and the Standard
+  Webhooks `webhook-*` names) cannot be overridden by a custom header. Enables W3C
+  `traceparent` propagation with no OpenTelemetry dependency.
+- **Per-endpoint transform hook** (ticket C-18) — an optional
+  `events.Transformer` (`Deps.Transformer`, plus `TransformerFunc`) reshapes the
+  outbound body per subscription in `Process`, **before** signing (so the
+  signature covers what is sent). It receives the destination `Subscription` to
+  branch per endpoint, shapes the body only (reserved/auth headers stay
+  protected), and a transform error aborts the attempt without a POST (recorded as
+  a failed attempt, retried by policy). Nil delivers the payload verbatim.
+
+### Deferred
+- **Batching** (ticket C-17) — deferred; it does not fit the per-(subscription,
+  event) idempotency / per-delivery-log / single-message-signing model without a
+  high-blast-radius rewrite, and the slow-subscriber driver is already served by
+  `adapters/ratelimit`. Rationale + a future design sketch are in
+  `docs/tickets/WORKLOG.md` and `docs/PMM-REPORT_2026-08-12.md`.
+
+### Changed
+- `Signer.Sign` signature changed (see above) — **breaking** for custom signers;
+  `hmacsign` updated (raw signature now via `hmacsign.Signature`).
+
+## [0.1.0] - 2026-08-12
+
+Initial release: outbound event-webhook delivery as a reusable, hexagonal Go
+library.
+
+### Added
+- **Core (`events`)** — pure, I/O-free domain: `Event`, `Subscription`,
+  `Delivery`, `Attempt`, `RetryPolicy`, the `Emitter` driving interface, and the
+  `Service` implementing fan-out → sign → deliver → retry → dead-letter → log.
+- **Ports** — `SubscriptionStore`, `DeliveryQueue`, `Deliverer`, `Signer`,
+  `DeliveryLog`, and the testability ports `Clock`, `IDGen`, `Rand`. The core
+  never calls `time.Now`/`rand` directly.
+- **Adapters** — `hmacsign` (HMAC-SHA256 + verify + `GenerateSecret`),
+  `httpdeliver` (net/http, timeouts, SSRF guard, no-redirect, response-snippet
+  capture), `inproc` (time-ordered worker pool honouring backoff), `memory`
+  (in-mem store + log), `dynamo` (org-partitioned DynamoDB store + log), `std`
+  (system Clock/IDGen/Rand).
+- **Facade (`webhooks`)** — batteries-included `New(ctx, Options)` that wires the
+  emitter to production defaults; only `Store` and `Log` are required.
+- **Per-org tenancy** — hard partitioning by `OrgID` in the store plus a
+  dispatcher-level org re-assertion; an org's event can never reach another org's
+  endpoint.
+- **Idempotency** — stable `DeliveryID(subscription, event)`; `X-Delivery-Id`
+  header for consumer dedup.
+- **Retries** — exponential backoff + jitter, a pluggable `RetryOn` classifier
+  (default: retry 5xx/429/408/transport, dead-letter other 4xx), then
+  dead-letter.
+- **Delivery log & replay** — every attempt (code, latency, error) recorded and
+  cursor-paginated; `Replay(orgID, deliveryID)` re-delivers a past event.
+- **Event-type matching** — exact, global `*`, and hierarchical prefix wildcards
+  (`calendar.event.*`).
+- **Anti-replay** — `X-Event-Timestamp` + `hmacsign.VerifyRequest` tolerance
+  window.
+- **Observability** — optional `Observer` hook fired per attempt.
+- **Ergonomics** — `Service.NewEvent` / `EmitNew` build-and-emit helpers.
+- Full core unit tests with fakes, an integration test over `httptest`, README,
+  CONSUMING, and the typed-interface reference.
+
+[Unreleased]: https://github.com/ab0t-com/ab0t-events-go/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/ab0t-com/ab0t-events-go/releases/tag/v0.1.0

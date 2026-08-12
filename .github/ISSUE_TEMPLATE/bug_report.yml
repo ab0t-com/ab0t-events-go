@@ -1,0 +1,33 @@
+name: Bug report
+description: Something isn't working as documented
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: Minimal steps or a small Go snippet. Which adapters were wired in?
+      render: go
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Module version / commit and `go version`.
+    validations:
+      required: true
+  - type: checkboxes
+    id: security
+    attributes:
+      label: Security
+      options:
+        - label: This is NOT a security vulnerability (report those privately per SECURITY.md)
+          required: true
