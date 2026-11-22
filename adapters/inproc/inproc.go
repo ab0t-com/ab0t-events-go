@@ -116,7 +116,13 @@ func (q *Queue) Start(ctx context.Context, handler events.Dispatcher) (stop func
 					select {
 					case <-ctx.Done():
 						return
-					case job := <-work:
+					case job, ok := <-work:
+						if !ok {
+							// The scheduler closed `work` on stop. A receive from a closed channel is
+							// immediately ready with a zero Job, so without this check a worker could
+							// race ctx.Done() and dispatch a phantom empty job during shutdown.
+							return
+						}
 						_ = handler.Process(ctx, job)
 					}
 				}

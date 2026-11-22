@@ -6,6 +6,17 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-22
+
+First tagged release. **Breaking** for `hmacsign` callers (see Finding 1 below); everything else is additive.
+
+### Fixed
+- **`inproc` never dispatches a phantom empty job on stop.** The scheduler closes the work channel when the
+  queue stops; a worker that was busy in `Process` could loop back to a `select` where both `ctx.Done()` and
+  the closed channel were ready and dispatch the closed channel's zero `Job` (empty delivery id). Workers now
+  return when the channel is closed. Found by `make check` (race); `TestQueue_StopNeverDispatchesAPhantomJob`
+  fails without the fix (proven on a scratch copy).
+
 ### Security (audit 2026-08-12 remediation — Findings 1–4)
 - **`hmacsign` now binds the timestamp and delivery id into the signature**
   (Finding 1, High). The MAC covers `{deliveryID}.{timestamp}.{body}` instead of
