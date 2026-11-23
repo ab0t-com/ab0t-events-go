@@ -54,10 +54,16 @@ Implemented by `*events.Service` (`events.NewService`). Hold it behind the
 A queue adapter drives one of these to process queued work:
 
 - `Dispatcher.Process(ctx, Job)` — for in-process queues that carry the full job.
+  A retry (`AttemptN > 1`) re-reads the subscription from the store, so it uses
+  a rotated secret and is dropped if the subscription was deleted.
 - `RefDispatcher.ProcessRef(ctx, JobRef)` — for durable/off-process queues that
   carry an id-only reference; it rehydrates via `Rehydrator` then dispatches, and
-  is **at-least-once safe** (drops references that are terminal or whose referent
-  is gone). Both are implemented by `*events.Service`.
+  is **at-least-once safe** (drops references that are terminal, whose referent
+  is gone, or that are a stale copy of a failed attempt whose retry is already
+  scheduled). Both are implemented by `*events.Service`.
+- Either way, an attempt that gets no answer because `ctx` was **cancelled**
+  (queue stop / shutdown) is not recorded and returns `ctx.Err()`; the delivery
+  keeps its previous state (a deadline is still a recorded failed attempt).
 
 ---
 
@@ -67,7 +73,7 @@ A queue adapter drives one of these to process queued work:
 | | |
 |---|---|
 | **Responsibility** | Persist subscriptions, partitioned per org. |
-| **Called by** | `Emit` (`ListForOrgAndType`), admin ops, `Rehydrate` (`Get`). |
+| **Called by** | `Emit` (`ListForOrgAndType`), admin ops, `Rehydrate` (`Get`), `Process` on a retry (`Get`). |
 | **Concurrency** | Safe for concurrent use. |
 | **Tenancy (hard)** | Every method is keyed by `orgID` and MUST NOT return, mutate, or delete another org's data. `ListForOrgAndType` returns only *active* subs whose types match (exact / `*` / `prefix.*`). |
 | **Errors** | Return `events.ErrNotFound` for a missing id in the org. Other errors propagate to the caller. |

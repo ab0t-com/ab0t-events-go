@@ -13,6 +13,12 @@ coverage.html
 go.work
 go.work.sum
 
+# Internal working notes (tickets, use-case maps, work logs, product reviews) — never
+# ship in the public library.
+/tickets/
+docs/tickets/
+.archive/
+
 # Editor / OS
 .idea/
 .vscode/

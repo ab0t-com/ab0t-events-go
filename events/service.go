@@ -8,6 +8,7 @@ import (
 	"errors"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Header names carried on every outbound delivery. Subscribers verify the
@@ -257,9 +258,47 @@ func toRawJSON(payload any) (json.RawMessage, error) {
 // it, records the attempt, and then either marks the delivery delivered,
 // schedules a backed-off retry, or dead-letters it once attempts are exhausted.
 // It is the handler a DeliveryQueue adapter's workers invoke.
+//
+// A retry (AttemptN > 1) acts on the CURRENT subscription, not the copy the job
+// was built with: Process re-reads it from the store, so a retry after
+// RotateSecret is signed with the new secret and a retry after Unsubscribe is
+// dropped without a POST (nil) — the same as the durable ProcessRef path. If the
+// store cannot be read (an error other than ErrNotFound) the job's copy is used,
+// as before, rather than losing the retry.
+//
+// An attempt that got no answer because ctx was CANCELLED (a queue stopping, a
+// process shutting down) is not a delivery verdict: nothing is recorded, the
+// Observer is not called, no retry is scheduled, and ctx.Err() is returned, so
+// the delivery keeps its previous (non-terminal) state for Recover or for the
+// durable queue's redelivery. A deadline (context.DeadlineExceeded) is still a
+// failed attempt.
 func (s *Service) Process(ctx context.Context, job Job) error {
 	if job.Event.OrgID != job.Subscription.OrgID {
 		return ErrTenancyViolation
+	}
+	if job.AttemptN > 1 && job.Subscription.ID != "" {
+		fresh, err := s.store.Get(ctx, job.Subscription.OrgID, job.Subscription.ID)
+		switch {
+		case errors.Is(err, ErrNotFound):
+			return nil // deleted since the job was built — nothing to do (as ProcessRef)
+		case err != nil:
+			// Store unreachable: keep the job's copy (v0.2.0 behaviour) rather than drop the retry.
+		case fresh.OrgID != job.Event.OrgID:
+			return ErrTenancyViolation
+		default:
+			job.Subscription = fresh
+		}
+	}
+	return s.process(ctx, job, false)
+}
+
+// process is one attempt. durable is true on the ProcessRef path: there a failed
+// attempt's retry is ARMED in two log writes (see the retry branch) so that a
+// redelivered copy of an attempt whose retry is already scheduled can be told
+// apart from one whose retry was never scheduled.
+func (s *Service) process(ctx context.Context, job Job, durable bool) error {
+	if job.Event.OrgID != job.Subscription.OrgID {
+		return ErrTenancyViolation // re-asserted for every caller (ProcessRef included)
 	}
 	body := []byte(job.Event.Payload)
 	start := s.clock.Now()
@@ -312,6 +351,13 @@ func (s *Service) Process(ctx context.Context, job Job) error {
 	}
 	end := s.clock.Now()
 
+	// No receiver answer and OUR context was cancelled: a shutdown, not a verdict.
+	// Do not record it (a final attempt would otherwise be dead-lettered and counted
+	// by autodisable against an endpoint that was never asked).
+	if postErr != nil && resp.StatusCode == 0 && errors.Is(ctx.Err(), context.Canceled) {
+		return ctx.Err()
+	}
+
 	att := Attempt{
 		N:       job.AttemptN,
 		At:      start,
@@ -341,7 +387,18 @@ func (s *Service) Process(ctx context.Context, job Job) error {
 		del.LastError = att.Error
 	}
 
-	if err := s.log.Record(ctx, DeliveryRecord{Delivery: del, Event: snapshot(job.Event), Attempt: att}); err != nil {
+	rec := del
+	if durable && del.Status == StatusFailed {
+		// Durable path, write 1 of 2: append the attempt but keep the delivery's
+		// attempt count at AttemptN-1 until the retry is actually scheduled (write 2
+		// below; for a retry due within retryArmGuard, until that retry runs). The
+		// Observer and the next job still see AttemptN, as before.
+		// If the retry is never scheduled (Enqueue fails, or the process dies
+		// here), a redelivered copy of this attempt still looks current and is
+		// re-run — exactly as before — instead of being dropped as stale and lost.
+		rec.Attempts = job.AttemptN - 1
+	}
+	if err := s.log.Record(ctx, DeliveryRecord{Delivery: rec, Event: snapshot(job.Event), Attempt: att}); err != nil {
 		return err
 	}
 	if s.observer != nil {
@@ -370,8 +427,30 @@ func (s *Service) Process(ctx context.Context, job Job) error {
 	next.Delivery = del
 	next.AttemptN = job.AttemptN + 1
 	next.NotBefore = end.Add(delay)
-	return s.queue.Enqueue(ctx, next)
+	if err := s.queue.Enqueue(ctx, next); err != nil {
+		return err
+	}
+	if durable && next.NotBefore.Sub(s.clock.Now()) >= retryArmGuard {
+		// Write 2 of 2: the retry is scheduled, so the attempt count advances to
+		// AttemptN; from now on ProcessRef drops a redelivered copy of this attempt
+		// as stale (no second POST, no second retry chain). Best effort: if this
+		// write fails the job's work is still done (attempt recorded, retry
+		// scheduled); the only cost is that such a duplicate is re-run as in v0.2.0.
+		// Skipped when the retry is due within retryArmGuard: a consumer could then
+		// run (and record) the retry before this write lands, and this older state
+		// would overwrite the newer one. Unarmed, the count catches up when the retry
+		// itself runs, which for such a short delay is almost at once.
+		_ = s.log.Record(ctx, DeliveryRecord{Delivery: del, Event: snapshot(job.Event)})
+	}
+	return nil
 }
+
+// retryArmGuard is how far in the future a durable retry must be scheduled for
+// process to arm stale-duplicate detection (write 2). It covers the earliest a
+// durable consumer may pick the retry up (sqsqueue runs a message up to ~1.5 s
+// before its NotBefore: whole-second SQS delays plus a 1 s re-defer threshold)
+// plus a generous allowance for the log write's own latency.
+const retryArmGuard = 5 * time.Second
 
 // reservedHeaders are the outbound header names the core and signer own; a
 // custom Event.Header may not override them. Compared case-insensitively.
@@ -517,7 +596,15 @@ func (s *Service) Rehydrate(ctx context.Context, ref JobRef) (Job, error) {
 // at-least-once redelivery such queues exhibit:
 //   - a reference whose delivery/subscription no longer exists is dropped (nil);
 //   - a delivery already in a terminal state (delivered or dead) is dropped, so a
-//     duplicate message never causes a duplicate POST.
+//     duplicate message never causes a duplicate POST;
+//   - a stale reference — the delivery is failed and its log already counts this
+//     attempt (ref.AttemptN <= Delivery.Attempts), i.e. the attempt ran and its
+//     retry was scheduled — is dropped, so a redelivered copy of a failed attempt
+//     neither re-POSTs nor forks a second retry chain. (On this path the attempt
+//     count is advanced only after the retry is enqueued; see process.)
+//
+// Not covered: two copies of the same attempt processed CONCURRENTLY (both read
+// the log before either records) can still both POST; that needs a lease.
 func (s *Service) ProcessRef(ctx context.Context, ref JobRef) error {
 	job, err := s.Rehydrate(ctx, ref)
 	switch {
@@ -529,7 +616,11 @@ func (s *Service) ProcessRef(ctx context.Context, ref JobRef) error {
 	if job.Delivery.Status == StatusDelivered || job.Delivery.Status == StatusDead {
 		return nil // already terminal — drop duplicate
 	}
-	return s.Process(ctx, job)
+	if job.Delivery.Status == StatusFailed && job.AttemptN <= job.Delivery.Attempts {
+		return nil // stale duplicate — this attempt ran and its retry is scheduled
+	}
+	// Rehydrate just read the subscription from the store; no second read needed.
+	return s.process(ctx, job, true)
 }
 
 // PingEventType is the type of the synthetic event Ping delivers.

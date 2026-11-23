@@ -18,6 +18,7 @@ package webhooks
 import (
 	"context"
 	"errors"
+	"sync"
 
 	"github.com/ab0t-com/ab0t-events-go/adapters/hmacsign"
 	"github.com/ab0t-com/ab0t-events-go/adapters/httpdeliver"
@@ -48,9 +49,9 @@ type Options struct {
 // (Emit, EmitNew, Subscribe, ListDeliveries, Replay, …) are available directly.
 type System struct {
 	*events.Service
-	queue  *inproc.Queue
-	stop   func()
-	closed bool
+	queue     *inproc.Queue
+	stop      func()
+	closeOnce sync.Once
 }
 
 // New builds and starts a webhook System. It returns an error only when a
@@ -96,14 +97,18 @@ func New(ctx context.Context, o Options) (*System, error) {
 	return &System{Service: svc, queue: queue, stop: stop}, nil
 }
 
-// Close stops the worker pool, blocking until in-flight deliveries drain. Safe to
-// call more than once.
+// Close stops the worker pool and blocks until every worker has returned. Safe to
+// call more than once, including concurrently (e.g. a deferred Close racing a
+// signal handler's): the first call stops the pool, later calls wait for it.
+//
+// An attempt whose POST is still in flight is cancelled and is NOT recorded (it
+// is not a verdict on the endpoint): its delivery keeps its previous pending or
+// failed state, so run Recover at the next start to deliver it.
 func (s *System) Close() {
-	if s == nil || s.closed {
+	if s == nil {
 		return
 	}
-	s.closed = true
-	s.stop()
+	s.closeOnce.Do(s.stop)
 }
 
 // Queue exposes the underlying in-process queue (e.g. to inspect Len in tests).

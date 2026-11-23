@@ -21,7 +21,7 @@ sys, err := webhooks.New(ctx, webhooks.Options{
     // Optional: Observer, Policy, Workers, Deliverer, Signer, ValidateURL, Clock/IDGen/Rand
 })
 if err != nil { return err }
-defer sys.Close() // stops the worker pool, draining in-flight deliveries
+defer sys.Close() // stops the worker pool; an interrupted attempt is not recorded — call Recover at start
 
 secret, _ := hmacsign.GenerateSecret() // "whsec_...", 256-bit; show once, store encrypted
 sys.Subscribe(ctx, events.NewSubscription{

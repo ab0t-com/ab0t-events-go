@@ -7,7 +7,8 @@ import (
 
 // Job is one unit of work on the DeliveryQueue: a single scheduled attempt to
 // deliver one Event to one Subscription. It carries the full Event and
-// Subscription so an in-process worker can act without re-reading stores; queue
+// Subscription so an in-process worker can act without re-reading stores (a
+// retry, AttemptN > 1, re-reads the subscription so rotation/deletion apply); queue
 // adapters that persist off-process (e.g. SQS) should carry the JobRef instead
 // (see Job.Ref) and rehydrate via Rehydrator, keeping secrets out of the queue.
 type Job struct {

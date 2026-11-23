@@ -23,7 +23,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	defer sys.Close() // stops the worker pool, draining in-flight deliveries
+	defer sys.Close() // stops the worker pool; an interrupted attempt is not recorded — call Recover at start
 	// --- end wire-in ---
 
 	// An org registers an endpoint (secret shown to them once).

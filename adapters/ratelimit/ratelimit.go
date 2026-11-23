@@ -9,7 +9,9 @@ package ratelimit
 
 import (
 	"context"
+	"net"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,11 +24,34 @@ type KeyFunc func(req events.DeliveryRequest) string
 
 // ByHost keys the limiter by the destination host, so one subscriber host cannot
 // be flooded regardless of how many subscriptions point at it.
+//
+// The key is canonical, so spellings that reach the same endpoint share one
+// bucket: the host name is lower-cased (DNS names are case-insensitive), a
+// trailing root dot is dropped, and the port is kept only when it is not the
+// scheme's default (443 for https, 80 for http). "https://Hooks.Example.com.:443/a"
+// and "https://hooks.example.com/b" both key as "hooks.example.com"; a
+// non-default port stays part of the key ("hooks.example.com:8443").
 func ByHost(req events.DeliveryRequest) string {
-	if u, err := url.Parse(req.URL); err == nil {
-		return u.Host
+	u, err := url.Parse(req.URL)
+	if err != nil {
+		return req.URL
 	}
-	return req.URL
+	host := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
+	if host == "" {
+		return u.Host // nothing to canonicalise (unchanged from v0.2.0)
+	}
+	port := u.Port()
+	switch strings.ToLower(u.Scheme) + ":" + port {
+	case "https:443", "http:80":
+		port = ""
+	}
+	if port != "" {
+		return net.JoinHostPort(host, port)
+	}
+	if strings.Contains(host, ":") {
+		return "[" + host + "]" // IPv6 literal keeps its brackets, as url.URL.Host has them
+	}
+	return host
 }
 
 // Config configures the limiter.
@@ -178,9 +203,10 @@ func WrapDeliverer(next events.Deliverer, cfg Config) *Deliverer {
 	return &Deliverer{next: next, limiter: NewLimiter(cfg), key: key}
 }
 
-// Post waits for a token (respecting ctx), then delegates. If ctx is cancelled
-// while waiting, it returns the context error, which the core treats as a
-// transient failure and retries with backoff.
+// Post waits for a token (respecting ctx), then delegates. If ctx is done while
+// waiting, it returns the context error: on a deadline the core treats it as a
+// transient failure and retries with backoff; on a cancellation (the queue
+// stopping) the core records nothing and the attempt runs again later.
 func (d *Deliverer) Post(ctx context.Context, req events.DeliveryRequest) (events.DeliveryResponse, error) {
 	if err := d.limiter.Wait(ctx, d.key(req)); err != nil {
 		return events.DeliveryResponse{}, err

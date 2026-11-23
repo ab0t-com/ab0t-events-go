@@ -22,8 +22,14 @@
 // A message is deleted only after the worker reports success (or a deliberate
 // drop). Infrastructure errors leave the message for SQS to redeliver after the
 // visibility timeout. Application-level retries are scheduled as fresh delayed
-// messages, and ProcessRef drops duplicates of already-terminal deliveries, so
-// at-least-once redelivery never causes a duplicate webhook.
+// messages, and ProcessRef drops duplicates of already-terminal deliveries and
+// stale duplicates of a failed attempt whose retry is already scheduled, so a
+// sequential redelivery does not cause a duplicate webhook. (Two copies of one
+// message processed at the same time — e.g. the visibility timeout lapsing
+// during a slow POST — can still both POST; keep VisibilityTimeout above your
+// Deliverer's timeout.) Stopping the queue mid-batch leaves the batch's
+// unstarted messages for redelivery instead of dispatching them on a cancelled
+// context.
 package sqsqueue
 
 import (
@@ -172,6 +178,12 @@ func (q *Queue) consume(ctx context.Context, handler events.RefDispatcher) {
 			continue
 		}
 		for _, m := range out.Messages {
+			if ctx.Err() != nil {
+				// Stopped mid-batch: do not dispatch the rest under a cancelled context
+				// (each would become a recorded, never-sent attempt). Left undeleted,
+				// they reappear after their visibility timeout — at-least-once.
+				return
+			}
 			q.handle(ctx, handler, m.Body, m.ReceiptHandle)
 		}
 	}

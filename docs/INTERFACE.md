@@ -74,7 +74,7 @@ normal policy. Reserved headers stay protected — a transform shapes the body o
 
 ```go
 func New(ctx context.Context, o Options) (*System, error) // *System embeds *events.Service
-func (s *System) Close()                                   // stop + drain
+func (s *System) Close()                                   // stop; waits for workers (an interrupted attempt is not recorded)
 ```
 
 `Options` requires `Store` and `Log`; `Deliverer`, `Signer`, `Policy`, `Workers`,
